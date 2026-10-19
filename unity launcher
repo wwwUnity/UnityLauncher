@@ -1,0 +1,746 @@
+import os
+import sys
+import json
+import random
+import string
+import smtplib
+import traceback
+import threading
+import webbrowser
+import subprocess
+import urllib.request
+from email.message import EmailMessage
+from pathlib import Path
+from tkinter import colorchooser, filedialog
+
+import customtkinter as ctk
+from PIL import Image, ImageDraw, ImageFont
+import minecraft_launcher_lib
+
+# ---------- НАСТРОЙКИ ----------
+APP_NAME = "UnityLauncher"
+TG_USER = "@unityLauncher"
+TG_URL = "https://t.me/unityLauncher"
+VERSION = "3.1.0"
+MC_DIR = str(Path.home() / ".unitylauncher")
+BG_FILE = Path(MC_DIR) / "background.png"
+LOGO_FILE = Path(MC_DIR) / "logo.png"
+ERROR_LOG = Path(MC_DIR) / "error.log"
+DATA_FILE = Path(MC_DIR) / "data.json"
+SETTINGS_FILE = Path(MC_DIR) / "settings.json"
+
+# --- ССЫЛКА НА ВАШ ФАЙЛ ВЕРСИИ (ЗАМЕНИТЕ НА СВОЮ) ---
+UPDATE_URL = "https://raw.githubusercontent.com/ВАШ_НИК/unity-launcher/main/version.json"
+
+# --- НАСТРОЙКИ ПОЧТЫ (ВПИШИТЕ СВОИ) ---
+SMTP_SERVER = "smtp.gmail.com"
+SMTP_PORT = 587
+SMTP_USER = "your_email@gmail.com"
+SMTP_PASSWORD = "your_app_password"
+
+# --- СПИСОК СКИНОВ ---
+SKINS_CATALOG = [
+    {"name": "Скин Steve (Классика)", "price": 0, "url": "https://minecraft-inside.ru/skins/"},
+    {"name": "Скин Alex (Стандарт)", "price": 50, "url": "https://minecraft-inside.ru/skins/"},
+    {"name": "Скин PvP Воин", "price": 150, "url": "https://minecraft-inside.ru/skins/"},
+    {"name": "Скин Ниндзя", "price": 200, "url": "https://minecraft-inside.ru/skins/"},
+    {"name": "Скин Рыцарь", "price": 250, "url": "https://minecraft-inside.ru/skins/"},
+]
+
+THEMES = {
+    "Фиолетовая": "#7b5cff",
+    "Красная": "#e74c3c",
+    "Зелёная": "#2ecc71",
+    "Синяя": "#3498db",
+    "Оранжевая": "#e67e22",
+    "Розовая": "#fd79a8",
+}
+
+MOD_SITES = [
+    ("CurseForge", "https://www.curseforge.com/minecraft"),
+    ("Modrinth", "https://modrinth.com/"),
+    ("MCMod", "https://www.mcmod.cn/"),
+    ("BBSMC", "https://bbsmc.net/"),
+    ("MineBBS", "https://www.minebbs.com/"),
+]
+
+VISUAL_SITES = [
+    ("Modrinth Shaders", "https://modrinth.com/shaders"),
+    ("CurseForge Shaders", "https://www.curseforge.com/minecraft/shaders"),
+    ("MinecraftShader", "https://minecraftshader.com/"),
+]
+
+BG_COLOR = "#0f0f14"
+PANEL_COLOR = "#17171f"
+TEXT = "#e6e6f0"
+SUBTEXT = "#8a8aa3"
+ACCENT = "#7b5cff"
+ACCENT_HOVER = "#9a80ff"
+
+ctk.set_appearance_mode("dark")
+
+
+def generate_logo():
+    if LOGO_FILE.exists():
+        return
+    try:
+        size = 256
+        img = Image.new("RGBA", (size, size), (0, 0, 0, 0))
+        draw = ImageDraw.Draw(img)
+        for i in range(size // 2, 0, -1):
+            ratio = i / (size // 2)
+            r, g, b = int(123 * (1 - ratio) + 154 * ratio), int(92 * (1 - ratio) + 128 * ratio), 255
+            draw.ellipse([size//2 - i, size//2 - i, size//2 + i, size//2 + i], fill=(r, g, b, 255))
+        try:
+            font = ImageFont.truetype("arial.ttf", 140)
+        except Exception:
+            font = ImageFont.load_default()
+        draw.text((size//2, size//2 - 10), "U", fill="white", font=font, anchor="mm")
+        img.save(LOGO_FILE)
+    except Exception:
+        pass
+
+
+class UnityLauncher(ctk.CTk):
+    def __init__(self):
+        super().__init__()
+        self.title(f"{APP_NAME} v{VERSION}")
+        self.geometry("1200x750")
+        self.minsize(1100, 700)
+        self.configure(fg_color=BG_COLOR)
+
+        Path(MC_DIR).mkdir(parents=True, exist_ok=True)
+        self.settings = self._load_json(SETTINGS_FILE, {"nickname": "", "version": "1.20.4", "theme": "Фиолетовая", "custom_accent": None, "registered": False, "email": ""})
+        self.data = self._load_json(DATA_FILE, {"friends": [], "achievements": [], "coins": 0, "owned_skins": []})
+        
+        self._apply_theme_from_settings()
+        self._bg_label = None
+        self._bg_image = None
+        self._page_builders = {}
+        self._built_pages = {}
+        self._all_versions_cache = [] 
+        self._selected_loader = "Vanilla"
+        self._email_code = None
+        self._email_target = None
+
+        try:
+            generate_logo()
+            self._show_registration()
+        except Exception:
+            self._log_error()
+
+    def _load_json(self, path, default):
+        if path.exists():
+            try:
+                return json.loads(path.read_text("utf-8"))
+            except Exception:
+                pass
+        return default
+
+    def _save_json(self, path, data):
+        path.write_text(json.dumps(data, indent=2, ensure_ascii=False), "utf-8")
+
+    def _log_error(self):
+        try:
+            with open(ERROR_LOG, "a", encoding="utf-8") as f:
+                f.write("\n===== " + str(Path.cwd()) + " =====\n")
+                f.write(traceback.format_exc())
+        except Exception:
+            pass
+        traceback.print_exc()
+
+    # ---------- РЕГИСТРАЦИЯ ----------
+    def _show_registration(self):
+        if self.settings.get("registered"):
+            self._build_layout()
+            self._check_update_async()
+            return
+
+        reg = ctk.CTkToplevel(self)
+        reg.title("Регистрация (Обязательно)")
+        reg.geometry("450x480")
+        reg.configure(fg_color=BG_COLOR)
+        reg.attributes("-topmost", True)
+        reg.protocol("WM_DELETE_WINDOW", self.destroy)
+
+        ctk.CTkLabel(reg, text="UNITY LAUNCHER", font=ctk.CTkFont(size=24, weight="bold"), text_color=ACCENT).pack(pady=(30, 5))
+        ctk.CTkLabel(reg, text="Без регистрации вход запрещён", font=ctk.CTkFont(size=14), text_color="#e74c3c").pack(pady=(0, 20))
+
+        ctk.CTkLabel(reg, text="Email", text_color=TEXT, font=ctk.CTkFont(size=12, weight="bold")).pack(anchor="w", padx=50)
+        email_entry = ctk.CTkEntry(reg, placeholder_text="example@mail.com", height=40, corner_radius=10, fg_color="#0e0e15", border_color="#2a2a3a")
+        email_entry.pack(fill="x", padx=50, pady=(5, 10))
+
+        ctk.CTkLabel(reg, text="Код подтверждения", text_color=TEXT, font=ctk.CTkFont(size=12, weight="bold")).pack(anchor="w", padx=50)
+        
+        code_frame = ctk.CTkFrame(reg, fg_color="transparent")
+        code_frame.pack(fill="x", padx=50, pady=(5, 15))
+        
+        code_entry = ctk.CTkEntry(code_frame, placeholder_text="6 цифр", height=40, corner_radius=10, fg_color="#0e0e15", border_color="#2a2a3a")
+        code_entry.pack(side="left", fill="x", expand=True, padx=(0, 10))
+
+        def send_code():
+            email = email_entry.get().strip()
+            if "@" not in email:
+                status.configure(text="⚠ Введите корректный email", text_color="#e74c3c")
+                return
+            
+            self._email_code = ''.join(random.choices(string.digits, k=6))
+            self._email_target = email
+            
+            def _send():
+                try:
+                    msg = EmailMessage()
+                    msg.set_content(f"Ваш код подтверждения для UnityLauncher: {self._email_code}")
+                    msg["Subject"] = "UnityLauncher - Код"
+                    msg["From"] = SMTP_USER
+                    msg["To"] = email
+                    
+                    with smtplib.SMTP(SMTP_SERVER, SMTP_PORT) as server:
+                        server.starttls()
+                        server.login(SMTP_USER, SMTP_PASSWORD)
+                        server.send_message(msg)
+                    
+                    self.after(0, lambda: status.configure(text="✅ Код отправлен на почту", text_color="#2ecc71"))
+                except Exception as e:
+                    self.after(0, lambda: status.configure(text=f"❌ Ошибка: {e}", text_color="#e74c3c"))
+            
+            threading.Thread(target=_send, daemon=True).start()
+            status.configure(text="Отправка...", text_color=SUBTEXT)
+
+        ctk.CTkButton(code_frame, text="Отправить", width=100, height=40, corner_radius=10, fg_color=ACCENT, command=send_code).pack(side="right")
+
+        status = ctk.CTkLabel(reg, text="", text_color=SUBTEXT, font=ctk.CTkFont(size=11))
+        status.pack()
+
+        def do_register():
+            email = email_entry.get().strip()
+            code = code_entry.get().strip()
+            
+            if not self._email_code or code != self._email_code:
+                status.configure(text="⚠ Неверный код", text_color="#e74c3c")
+                return
+            if email != self._email_target:
+                status.configure(text="⚠ Email не совпадает", text_color="#e74c3c")
+                return
+                
+            self.settings["nickname"] = email.split("@")[0]
+            self.settings["registered"] = True
+            self.settings["email"] = email
+            self._save_json(SETTINGS_FILE, self.settings)
+            reg.destroy()
+            self._build_layout()
+            self._check_update_async()
+
+        ctk.CTkButton(reg, text="Зарегистрироваться", height=45, corner_radius=10, fg_color=ACCENT, command=do_register).pack(fill="x", padx=50, pady=(20, 10))
+
+    # ---------- НАСТРОЙКИ / ТЕМЫ ----------
+    def _apply_theme_from_settings(self):
+        global ACCENT, ACCENT_HOVER
+        custom = self.settings.get("custom_accent")
+        if custom:
+            ACCENT = custom
+        else:
+            name = self.settings.get("theme", "Фиолетовая")
+            if name in THEMES:
+                ACCENT = THEMES[name]
+        ACCENT_HOVER = self._lighten(ACCENT, 0.2)
+
+    def _lighten(self, hex_color, amount=0.2):
+        hex_color = hex_color.lstrip("#")
+        r, g, b = int(hex_color[0:2], 16), int(hex_color[2:4], 16), int(hex_color[4:6], 16)
+        r, g, b = min(255, int(r + (255 - r) * amount)), min(255, int(g + (255 - g) * amount)), min(255, int(b + (255 - b) * amount))
+        return f"#{r:02x}{g:02x}{b:02x}"
+
+    # ---------- КАРКАС ----------
+    def _build_layout(self):
+        try:
+            self._apply_background()
+
+            self.sidebar = ctk.CTkFrame(self, width=240, corner_radius=0, fg_color=PANEL_COLOR)
+            self.sidebar.pack(side="left", fill="y")
+            self.sidebar.pack_propagate(False)
+            self._build_sidebar()
+
+            self.container = ctk.CTkFrame(self, fg_color="transparent")
+            self.container.pack(side="right", fill="both", expand=True)
+
+            self._page_builders = {
+                "home": self._build_home_page,
+                "friends": self._build_friends_page,
+                "achievements": self._build_achievements_page,
+                "skins": self._build_skins_page,
+                "mods": lambda: self._build_sites_page("📦 Скачать моды", MOD_SITES),
+                "visuals": lambda: self._build_sites_page("🎨 Визуалы", VISUAL_SITES),
+                "ingame": self._build_ingame_page,
+            }
+            self._built_pages = {}
+
+            self._show_page("home")
+        except Exception:
+            self._log_error()
+
+    def _apply_background(self):
+        if self._bg_label:
+            self._bg_label.destroy()
+            self._bg_label = None
+        if BG_FILE.exists():
+            try:
+                img = Image.open(BG_FILE).convert("RGBA")
+                self._bg_image = ctk.CTkImage(light_image=img, dark_image=img, size=(1200, 750))
+                self._bg_label = ctk.CTkLabel(self, text="", image=self._bg_image)
+                self._bg_label.place(x=0, y=0, relwidth=1, relheight=1)
+                self._bg_label.lower()
+            except Exception:
+                pass
+
+    def _build_sidebar(self):
+        try:
+            logo_img = Image.open(LOGO_FILE)
+            self.sidebar_logo = ctk.CTkImage(light_image=logo_img, dark_image=logo_img, size=(50, 50))
+            ctk.CTkLabel(self.sidebar, image=self.sidebar_logo, text="").pack(pady=(20, 5), padx=24, anchor="w")
+        except Exception:
+            pass
+
+        ctk.CTkLabel(self.sidebar, text="UNITY\nLAUNCHER", font=ctk.CTkFont(size=24, weight="bold"), text_color=ACCENT, justify="left").pack(pady=(0, 4), padx=24, anchor="w")
+        ctk.CTkFrame(self.sidebar, height=1, fg_color="#2a2a3a").pack(fill="x", padx=24, pady=12)
+
+        self._nav(self.sidebar, "🏠  Главная", lambda: self._show_page("home"))
+        self._nav(self.sidebar, "👥  Друзья", lambda: self._show_page("friends"))
+        self._nav(self.sidebar, "🎖  Достижения", lambda: self._show_page("achievements"))
+        self._nav(self.sidebar, "🧑  Скины", lambda: self._show_page("skins"))
+        ctk.CTkFrame(self.sidebar, height=1, fg_color="#2a2a3a").pack(fill="x", padx=24, pady=8)
+        self._nav(self.sidebar, "📦  Моды", lambda: self._show_page("mods"))
+        self._nav(self.sidebar, "🎨  Визуалы", lambda: self._show_page("visuals"))
+        self._nav(self.sidebar, "⚔  В игре", lambda: self._show_page("ingame"))
+        ctk.CTkFrame(self.sidebar, height=1, fg_color="#2a2a3a").pack(fill="x", padx=24, pady=8)
+        self._nav(self.sidebar, "🎨  Темы", self._open_themes)
+        self._nav(self.sidebar, "🖼  Сменить фон", self._choose_background)
+        self._nav(self.sidebar, "🔄  Обновить", self._check_update_async)
+
+        self.coin_label = ctk.CTkLabel(self.sidebar, text=f"🪙 {self.data.get('coins', 0)}", font=ctk.CTkFont(size=14, weight="bold"), text_color="#f1c40f")
+        self.coin_label.pack(side="bottom", pady=10)
+
+        ctk.CTkButton(self.sidebar, text=f"✈  {TG_USER}", fg_color="#229ED9", command=lambda: webbrowser.open(TG_URL)).pack(side="bottom", fill="x", padx=18, pady=18)
+
+    def _nav(self, parent, text, cmd):
+        ctk.CTkButton(parent, text=text, anchor="w", height=36, corner_radius=10, fg_color="transparent", hover_color="#22222e", text_color=TEXT, font=ctk.CTkFont(size=13), command=cmd).pack(fill="x", padx=12, pady=1)
+
+    def _show_page(self, name):
+        try:
+            for page in self._built_pages.values():
+                if page.winfo_ismapped():
+                    page.pack_forget()
+
+            if name not in self._built_pages:
+                builder = self._page_builders.get(name)
+                if not builder:
+                    return
+                self._built_pages[name] = builder()
+
+            self._built_pages[name].pack(fill="both", expand=True, padx=28, pady=24)
+        except Exception:
+            self._log_error()
+
+    # ---------- ПРОВЕРКА ОБНОВЛЕНИЙ ----------
+    def _check_update_async(self):
+        threading.Thread(target=self._check_update, daemon=True).start()
+
+    def _check_update(self):
+        try:
+            req = urllib.request.Request(UPDATE_URL, headers={'User-Agent': 'Mozilla/5.0'})
+            with urllib.request.urlopen(req, timeout=5) as response:
+                remote_data = json.loads(response.read().decode())
+                remote_version = remote_data.get("version", "0.0.0")
+            
+            if remote_version != VERSION:
+                self.after(0, lambda: self._show_update_dialog(remote_version))
+            else:
+                self.after(0, lambda: self.status.configure(text="✅ Обновлений нет. У вас последняя версия."))
+        except Exception as e:
+            self.after(0, lambda: self.status.configure(text=f"❌ Ошибка проверки: {e}"))
+
+    def _show_update_dialog(self, remote_version):
+        win = ctk.CTkToplevel(self)
+        win.title("Доступно обновление")
+        win.geometry("400x200")
+        win.configure(fg_color=BG_COLOR)
+        win.attributes("-topmost", True)
+        
+        ctk.CTkLabel(win, text="🔄 Доступно обновление!", font=ctk.CTkFont(size=18, weight="bold"), text_color=TEXT).pack(pady=20)
+        ctk.CTkLabel(win, text=f"Ваша версия: {VERSION}\nНовая версия: {remote_version}", text_color=SUBTEXT).pack()
+        
+        def open_download():
+            webbrowser.open("https://github.com/ВАШ_НИК/unity-launcher/releases")
+            win.destroy()
+        
+        ctk.CTkButton(win, text="Скачать", height=40, fg_color=ACCENT, command=open_download).pack(pady=20)
+
+    # ---------- ВКЛАДКИ ----------
+    def _build_friends_page(self):
+        frame = ctk.CTkFrame(self.container, fg_color="transparent")
+        ctk.CTkLabel(frame, text="👥 Друзья", font=ctk.CTkFont(size=28, weight="bold"), text_color=TEXT).pack(anchor="w", pady=(0, 10))
+        
+        card = ctk.CTkFrame(frame, fg_color=PANEL_COLOR, corner_radius=16)
+        card.pack(fill="both", expand=True, pady=10, padx=10)
+        
+        scroll = ctk.CTkScrollableFrame(card, fg_color="transparent")
+        scroll.pack(fill="both", expand=True, padx=20, pady=20)
+        
+        ctk.CTkLabel(scroll, text="⚠️ Онлайн-статус друзей требует подключения к серверу.\nВ данной версии список друзей локальный.", text_color=SUBTEXT).pack(pady=10)
+        
+        if not self.data["friends"]:
+            ctk.CTkLabel(scroll, text="Список друзей пуст.", text_color=SUBTEXT).pack(pady=20)
+        else:
+            for friend in self.data["friends"]:
+                f_frame = ctk.CTkFrame(scroll, fg_color="#1a1a24", corner_radius=10)
+                f_frame.pack(fill="x", pady=5)
+                ctk.CTkLabel(f_frame, text=friend, font=ctk.CTkFont(size=14), text_color=TEXT).pack(side="left", padx=15, pady=10)
+        
+        add_frame = ctk.CTkFrame(frame, fg_color="transparent")
+        add_frame.pack(fill="x", pady=10)
+        
+        friend_entry = ctk.CTkEntry(add_frame, placeholder_text="Ник друга", height=40, corner_radius=10, fg_color="#0e0e15")
+        friend_entry.pack(side="left", fill="x", expand=True, padx=(0, 10))
+        
+        def add_friend():
+            name = friend_entry.get().strip()
+            if name and name not in self.data["friends"]:
+                self.data["friends"].append(name)
+                self._save_json(DATA_FILE, self.data)
+                friend_entry.delete(0, "end")
+                self._show_page("home")
+                self._show_page("friends")
+        
+        ctk.CTkButton(add_frame, text="Добавить", width=100, height=40, corner_radius=10, fg_color=ACCENT, command=add_friend).pack(side="right")
+        return frame
+
+    def _build_achievements_page(self):
+        frame = ctk.CTkFrame(self.container, fg_color="transparent")
+        ctk.CTkLabel(frame, text="🎖 Достижения", font=ctk.CTkFont(size=28, weight="bold"), text_color=TEXT).pack(anchor="w", pady=(0, 10))
+        
+        card = ctk.CTkFrame(frame, fg_color=PANEL_COLOR, corner_radius=16)
+        card.pack(fill="both", expand=True, pady=10, padx=10)
+        
+        scroll = ctk.CTkScrollableFrame(card, fg_color="transparent")
+        scroll.pack(fill="both", expand=True, padx=20, pady=20)
+        
+        if not self.data["achievements"]:
+            ctk.CTkLabel(scroll, text="Достижений пока нет.\nЗапустите игру, чтобы получить первое!", text_color=SUBTEXT).pack(pady=50)
+        else:
+            for ach in self.data["achievements"]:
+                a_frame = ctk.CTkFrame(scroll, fg_color="#1a1a24", corner_radius=10)
+                a_frame.pack(fill="x", pady=5)
+                ctk.CTkLabel(a_frame, text=f"🏆 {ach}", font=ctk.CTkFont(size=14), text_color=TEXT).pack(side="left", padx=15, pady=10)
+        
+        return frame
+
+    def _build_skins_page(self):
+        frame = ctk.CTkFrame(self.container, fg_color="transparent")
+        ctk.CTkLabel(frame, text="🧑 Скины", font=ctk.CTkFont(size=28, weight="bold"), text_color=TEXT).pack(anchor="w", pady=(0, 10))
+        
+        card = ctk.CTkFrame(frame, fg_color=PANEL_COLOR, corner_radius=16)
+        card.pack(fill="both", expand=True, pady=10, padx=10)
+        
+        scroll = ctk.CTkScrollableFrame(card, fg_color="transparent")
+        scroll.pack(fill="both", expand=True, padx=20, pady=20)
+        
+        for skin in SKINS_CATALOG:
+            s_frame = ctk.CTkFrame(scroll, fg_color="#1a1a24", corner_radius=10)
+            s_frame.pack(fill="x", pady=5)
+            
+            ctk.CTkLabel(s_frame, text=skin["name"], font=ctk.CTkFont(size=14), text_color=TEXT).pack(side="left", padx=15, pady=10)
+            
+            owned = skin["name"] in self.data.get("owned_skins", [])
+            price = skin["price"]
+            
+            if owned:
+                ctk.CTkLabel(s_frame, text="✅ Куплено", text_color="#2ecc71").pack(side="right", padx=15)
+            else:
+                def buy(s=skin):
+                    if self.data["coins"] >= s["price"]:
+                        self.data["coins"] -= s["price"]
+                        self.data["owned_skins"].append(s["name"])
+                        self._save_json(DATA_FILE, self.data)
+                        self.coin_label.configure(text=f"🪙 {self.data['coins']}")
+                        self._show_page("home")
+                        self._show_page("skins")
+                    else:
+                        pass
+                
+                ctk.CTkButton(s_frame, text=f"Купить ({price} 🪙)", width=120, height=30, fg_color=ACCENT, command=buy).pack(side="right", padx=15)
+        
+        ctk.CTkButton(scroll, text="🌐 Скины на Minecraft-Inside", fg_color="transparent", border_width=1, command=lambda: webbrowser.open("https://minecraft-inside.ru/skins/")).pack(pady=10)
+        ctk.CTkButton(scroll, text="🌐 Скины на 3DM", fg_color="transparent", border_width=1, command=lambda: webbrowser.open("https://dl.3dmgame.com/patch/mcskinmod_21.html")).pack(pady=5)
+        
+        return frame
+
+    # ---------- ОКНО ВЫБОРА ВЕРСИЙ ----------
+    def _open_version_selector(self):
+        win = ctk.CTkToplevel(self)
+        win.title("Версии Minecraft")
+        win.geometry("550x650")
+        win.configure(fg_color=BG_COLOR)
+        win.attributes("-topmost", True)
+
+        ctk.CTkLabel(win, text="Выберите версию", font=ctk.CTkFont(size=18, weight="bold"), text_color=TEXT).pack(pady=10)
+        
+        search_var = ctk.StringVar()
+        ctk.CTkEntry(win, placeholder_text="Поиск...", textvariable=search_var, height=40).pack(fill="x", padx=20, pady=10)
+
+        scroll = ctk.CTkScrollableFrame(win, fg_color=PANEL_COLOR, corner_radius=12)
+        scroll.pack(fill="both", expand=True, padx=20, pady=(0, 20))
+
+        if not self._all_versions_cache:
+            ctk.CTkLabel(scroll, text="Загрузка версий...", text_color=SUBTEXT).pack(pady=20)
+            return
+
+        def get_approx_size(ver):
+            if ver.startswith("1.20"): return "~300 МБ"
+            if ver.startswith("1.19"): return "~280 МБ"
+            if ver.startswith("1.18"): return "~250 МБ"
+            if ver.startswith("1.16"): return "~200 МБ"
+            return "~150 МБ"
+
+        all_buttons = []
+        for version in self._all_versions_cache:
+            size = get_approx_size(version)
+            text = f"{version}  ({size})"
+            btn = ctk.CTkButton(scroll, text=text, anchor="w", height=35, corner_radius=8, fg_color="transparent", hover_color="#22222e", text_color=TEXT, command=lambda v=version: self._select_version(v, win))
+            btn.pack(fill="x", pady=1)
+            all_buttons.append((version, btn))
+
+        def filter_versions(*args):
+            query = search_var.get().lower()
+            for v_name, btn in all_buttons:
+                if query in v_name.lower():
+                    btn.pack(fill="x", pady=1)
+                else:
+                    btn.pack_forget()
+
+        search_var.trace_add("write", filter_versions)
+
+    def _select_version(self, version, window):
+        self.settings["version"] = version
+        self._save_json(SETTINGS_FILE, self.settings)
+        self.version_button.configure(text=f"Выбрано: {version}")
+        window.destroy()
+
+    # ---------- ДЕЙСТВИЯ ----------
+    def _choose_background(self):
+        try:
+            path = filedialog.askopenfilename(title="Выберите картинку", filetypes=[("Изображения", "*.png *.jpg *.jpeg")])
+            if not path:
+                return
+            img = Image.open(path).convert("RGBA")
+            img.save(BG_FILE)
+            self._apply_background()
+        except Exception:
+            pass
+
+    def _open_themes(self):
+        win = ctk.CTkToplevel(self)
+        win.title("Темы")
+        win.geometry("380x450")
+        win.configure(fg_color=BG_COLOR)
+        win.attributes("-topmost", True)
+        ctk.CTkLabel(win, text="Выберите тему", font=ctk.CTkFont(size=16, weight="bold"), text_color=TEXT).pack(pady=15)
+        for name, color in THEMES.items():
+            ctk.CTkButton(win, text=name, height=38, corner_radius=10, fg_color=color, hover_color=self._lighten(color), command=lambda n=name: self._set_theme(n, win)).pack(fill="x", padx=30, pady=4)
+        
+        ctk.CTkButton(win, text="🎨 Своя палитра", height=42, corner_radius=10, fg_color=ACCENT, hover_color=ACCENT_HOVER, command=self._pick_custom_color).pack(fill="x", padx=30, pady=15)
+
+    def _set_theme(self, name, win):
+        self.settings["theme"] = name
+        self.settings["custom_accent"] = None
+        self._save_json(SETTINGS_FILE, self.settings)
+        win.destroy()
+
+    def _pick_custom_color(self):
+        color = colorchooser.askcolor(title="Выберите акцентный цвет")
+        if color and color[1]:
+            self.settings["custom_accent"] = color[1]
+            self._save_json(SETTINGS_FILE, self.settings)
+            global ACCENT, ACCENT_HOVER
+            ACCENT = color[1]
+            ACCENT_HOVER = self._lighten(ACCENT, 0.2)
+            self._show_page("home")
+
+    # ---------- ЗАГРУЗКА ВЕРСИЙ ----------
+    def _load_versions_async(self):
+        threading.Thread(target=self._load_versions, daemon=True).start()
+
+    def _load_versions(self):
+        try:
+            all_versions = []
+            for v in minecraft_launcher_lib.utils.get_version_list():
+                all_versions.append(v["id"])
+            all_versions.sort(reverse=True)
+            self._all_versions_cache = all_versions
+
+            def update_ui():
+                if self.winfo_exists() and hasattr(self, 'status'):
+                    self.status.configure(text=f"Готов (найдено {len(all_versions)} версий)")
+                    if self.settings.get("version") not in all_versions and all_versions:
+                        self.settings["version"] = all_versions[0]
+                        self._save_json(SETTINGS_FILE, self.settings)
+                        if hasattr(self, 'version_button'):
+                            self.version_button.configure(text=f"Выбрано: {all_versions[0]}")
+            self.after(0, update_ui)
+        except Exception as e:
+            self.after(0, lambda: self.status.configure(text=f"Ошибка: {e}"))
+
+    def _set_progress(self, value, text=None):
+        self.after(0, lambda: self.progress.set(value))
+        if text:
+            self.after(0, lambda: self.status.configure(text=text))
+
+    # ---------- ЗАПУСК ----------
+    def _play(self):
+        nick = self.nick_entry.get().strip()
+        selected = self.settings.get("version", "")
+        
+        if not (3 <= len(nick) <= 16):
+            self.status.configure(text="⚠ Ник 3–16 символов")
+            return
+        if not selected:
+            self.status.configure(text="⚠ Выберите версию")
+            return
+        
+        self.settings["nickname"] = nick
+        self._save_json(SETTINGS_FILE, self.settings)
+        self.play_btn.configure(state="disabled", text="ЗАПУСК...")
+        self.progress.configure(mode="indeterminate")
+        self.progress.start()
+        threading.Thread(target=self._launch, args=(nick, selected), daemon=True).start()
+
+    def _launch(self, nick, selected):
+        try:
+            loader = self._selected_loader
+            installed = selected
+            
+            def update_status(text):
+                self._set_progress(0.5, text)
+
+            callback_dict = {
+                "setStatus": update_status,
+                "setProgress": lambda p: self.after(0, lambda: self.progress.set(p / 100)),
+                "setMax": lambda m: None
+            }
+
+            if loader == "Forge":
+                loader_obj = minecraft_launcher_lib.mod_loader.get_mod_loader("forge")
+                installed = loader_obj.install(selected, MC_DIR, callback=callback_dict)
+            elif loader == "NeoForge":
+                loader_obj = minecraft_launcher_lib.mod_loader.get_mod_loader("neoforge")
+                installed = loader_obj.install(selected, MC_DIR, callback=callback_dict)
+            elif loader == "Fabric":
+                loader_obj = minecraft_launcher_lib.mod_loader.get_mod_loader("fabric")
+                installed = loader_obj.install(selected, MC_DIR, callback=callback_dict)
+            else:
+                minecraft_launcher_lib.install.install_minecraft_version(selected, MC_DIR, callback=callback_dict)
+                installed = selected
+
+            self.after(0, lambda: self.progress.stop())
+            self.after(0, lambda: self.progress.configure(mode="determinate"))
+            self._set_progress(0.95, "Запуск...")
+            
+            cmd = minecraft_launcher_lib.command.get_minecraft_command(installed, MC_DIR, {"username": nick, "uuid": "", "token": ""})
+
+            kwargs = {"cwd": MC_DIR}
+            if sys.platform == "win32":
+                kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.DETACHED_PROCESS
+                kwargs["stdin"] = subprocess.DEVNULL
+                kwargs["stdout"] = subprocess.DEVNULL
+                kwargs["stderr"] = subprocess.DEVNULL
+            else:
+                kwargs["start_new_session"] = True
+                
+            subprocess.Popen(cmd, **kwargs)
+            
+            if "Первый запуск" not in self.data["achievements"]:
+                self.data["achievements"].append("Первый запуск")
+                self.data["coins"] += 50
+                self._save_json(DATA_FILE, self.data)
+                self.after(0, lambda: self.coin_label.configure(text=f"🪙 {self.data['coins']}"))
+                
+            self._set_progress(1.0, "✅ Игра запущена!")
+            
+        except Exception as e:
+            self.after(0, lambda: self.progress.stop())
+            self.after(0, lambda: self.progress.configure(mode="determinate"))
+            self._set_progress(0, f"❌ Ошибка: {e}")
+        finally:
+            self.after(0, lambda: self.play_btn.configure(state="normal", text="▶  ИГРАТЬ"))
+
+    # ---------- ГЛАВНАЯ СТРАНИЦА ----------
+    def _build_home_page(self):
+        frame = ctk.CTkFrame(self.container, fg_color="transparent")
+        ctk.CTkLabel(frame, text="Добро пожаловать!", font=ctk.CTkFont(size=28, weight="bold"), text_color=TEXT).pack(anchor="w")
+        ctk.CTkLabel(frame, text="Выберите загрузчик и версию", font=ctk.CTkFont(size=13), text_color=SUBTEXT).pack(anchor="w", pady=(2, 20))
+
+        card = ctk.CTkFrame(frame, fg_color=PANEL_COLOR, corner_radius=16)
+        card.pack(fill="x")
+        inner = ctk.CTkFrame(card, fg_color="transparent")
+        inner.pack(fill="x", padx=24, pady=20)
+
+        ctk.CTkLabel(inner, text="Никнейм", text_color=TEXT, font=ctk.CTkFont(size=12, weight="bold")).pack(anchor="w")
+        self.nick_entry = ctk.CTkEntry(inner, placeholder_text="Введите ник", height=42, corner_radius=10, fg_color="#0e0e15", border_color="#2a2a3a", text_color=TEXT)
+        self.nick_entry.pack(fill="x", pady=(6, 16))
+        if self.settings.get("nickname"):
+            self.nick_entry.insert(0, self.settings["nickname"])
+
+        ctk.CTkLabel(inner, text="Загрузчик", text_color=TEXT, font=ctk.CTkFont(size=12, weight="bold")).pack(anchor="w")
+        self.loader_combo = ctk.CTkComboBox(inner, values=["Vanilla", "Forge", "NeoForge", "Fabric"], height=42, corner_radius=10, fg_color="#0e0e15", border_color="#2a2a3a", button_color=ACCENT, text_color=TEXT, command=self._on_loader_change)
+        self.loader_combo.pack(fill="x", pady=(6, 16))
+        self.loader_combo.set("Vanilla")
+
+        ctk.CTkLabel(inner, text="Версия Minecraft", text_color=TEXT, font=ctk.CTkFont(size=12, weight="bold")).pack(anchor="w")
+        self.version_button = ctk.CTkButton(inner, text=f"Выбрать версию ({self.settings.get('version', '1.20.4')})", height=42, corner_radius=10, fg_color="#0e0e15", border_color="#2a2a3a", border_width=1, text_color=TEXT, hover_color="#22222e", command=self._open_version_selector)
+        self.version_button.pack(fill="x", pady=(6, 0))
+
+        self.status = ctk.CTkLabel(frame, text="Загрузка версий...", font=ctk.CTkFont(size=12), text_color=SUBTEXT)
+        self.status.pack(anchor="w", pady=(16, 4))
+
+        self.progress = ctk.CTkProgressBar(frame, height=8, corner_radius=4, fg_color="#1a1a24", progress_color=ACCENT)
+        self.progress.pack(fill="x")
+        self.progress.set(0)
+
+        self.play_btn = ctk.CTkButton(frame, text="▶  ИГРАТЬ", height=56, corner_radius=14, font=ctk.CTkFont(size=18, weight="bold"), fg_color=ACCENT, hover_color=ACCENT_HOVER, command=self._play)
+        self.play_btn.pack(fill="x", pady=(22, 0))
+        
+        self.after(500, self._load_versions_async)
+        return frame
+
+    def _on_loader_change(self, choice):
+        self._selected_loader = choice
+
+    # ---------- ВСПОМОГАТЕЛЬНЫЕ ----------
+    def _build_sites_page(self, title, sites):
+        frame = ctk.CTkFrame(self.container, fg_color="transparent")
+        ctk.CTkLabel(frame, text=title, font=ctk.CTkFont(size=28, weight="bold"), text_color=TEXT).pack(anchor="w", pady=(0, 10))
+        card = ctk.CTkFrame(frame, fg_color=PANEL_COLOR, corner_radius=16)
+        card.pack(fill="both", expand=True, pady=10)
+        scroll = ctk.CTkScrollableFrame(card, fg_color="transparent")
+        scroll.pack(fill="both", expand=True, padx=14, pady=(20, 14))
+        for name, url in sites:
+            ctk.CTkButton(scroll, text=f"🔗 {name}", anchor="w", height=40, corner_radius=10, fg_color="transparent", hover_color="#22222e", text_color=TEXT, command=lambda u=url: webbrowser.open(u)).pack(fill="x", pady=3)
+        return frame
+
+    def _build_ingame_page(self):
+        frame = ctk.CTkFrame(self.container, fg_color="transparent")
+        ctk.CTkLabel(frame, text="⚔ В игре", font=ctk.CTkFont(size=28, weight="bold"), text_color=TEXT).pack(anchor="w", pady=(0, 10))
+        scroll = ctk.CTkScrollableFrame(frame, fg_color="transparent")
+        scroll.pack(fill="both", expand=True)
+        ctk.CTkLabel(scroll, text="Оптимизация:\n• Sodium\n• Lithium\n• FerriteCore\n\nPvP:\n• AppleSkin\n• Armor HUD\n• TotemCounter", font=ctk.CTkFont(size=14), text_color=TEXT, justify="left").pack(anchor="w", padx=20, pady=20)
+        return frame
+
+
+if __name__ == "__main__":
+    try:
+        app = UnityLauncher()
+        app.mainloop()
+    except Exception:
+        Path(MC_DIR).mkdir(parents=True, exist_ok=True)
+        with open(ERROR_LOG, "a", encoding="utf-8") as f:
+            f.write(traceback.format_exc())
+        raise
